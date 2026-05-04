@@ -3,7 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
-use async_trait::async_trait;
+use codex_protocol::items::McpToolCallError;
+use codex_protocol::items::McpToolCallItem;
+use codex_protocol::items::McpToolCallStatus;
+use codex_protocol::items::TurnItem;
 use codex_protocol::mcp::CallToolResult;
 use codex_protocol::models::function_call_output_content_items_to_text;
 use rmcp::model::ListResourceTemplatesResult;
@@ -18,18 +21,15 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::codex::Session;
-use crate::codex::TurnContext;
 use crate::function_tool::FunctionCallError;
-use crate::protocol::EventMsg;
-use crate::protocol::McpInvocation;
-use crate::protocol::McpToolCallBeginEvent;
-use crate::protocol::McpToolCallEndEvent;
+use crate::session::session::Session;
+use crate::session::turn_context::TurnContext;
 use crate::tools::context::FunctionToolOutput;
 use crate::tools::context::ToolInvocation;
 use crate::tools::context::ToolPayload;
 use crate::tools::registry::ToolHandler;
 use crate::tools::registry::ToolKind;
+use codex_protocol::protocol::McpInvocation;
 
 pub struct McpResourceHandler;
 
@@ -178,7 +178,6 @@ struct ReadResourcePayload {
     result: ReadResourceResult,
 }
 
-#[async_trait]
 impl ToolHandler for McpResourceHandler {
     type Output = FunctionToolOutput;
 
@@ -207,7 +206,7 @@ impl ToolHandler for McpResourceHandler {
 
         let arguments_value = parse_arguments(arguments.as_str())?;
 
-        match tool_name.as_str() {
+        match tool_name.name.as_str() {
             "list_mcp_resources" => {
                 handle_list_resources(
                     Arc::clone(&session),
@@ -242,6 +241,10 @@ impl ToolHandler for McpResourceHandler {
     }
 }
 
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "MCP resource listing reads through the session-owned manager guard"
+)]
 async fn handle_list_resources(
     session: Arc<Session>,
     turn: Arc<TurnContext>,
@@ -346,6 +349,10 @@ async fn handle_list_resources(
     }
 }
 
+#[expect(
+    clippy::await_holding_invalid_type,
+    reason = "MCP resource template listing reads through the session-owned manager guard"
+)]
 async fn handle_list_resource_templates(
     session: Arc<Session>,
     turn: Arc<TurnContext>,
@@ -558,15 +565,23 @@ async fn emit_tool_call_begin(
     call_id: &str,
     invocation: McpInvocation,
 ) {
-    session
-        .send_event(
-            turn,
-            EventMsg::McpToolCallBegin(McpToolCallBeginEvent {
-                call_id: call_id.to_string(),
-                invocation,
-            }),
-        )
-        .await;
+    let McpInvocation {
+        server,
+        tool,
+        arguments,
+    } = invocation;
+    let item = TurnItem::McpToolCall(McpToolCallItem {
+        id: call_id.to_string(),
+        server,
+        tool,
+        arguments: arguments.unwrap_or(Value::Null),
+        mcp_app_resource_uri: None,
+        status: McpToolCallStatus::InProgress,
+        result: None,
+        error: None,
+        duration: None,
+    });
+    session.emit_turn_item_started(turn, &item).await;
 }
 
 async fn emit_tool_call_end(
@@ -577,17 +592,34 @@ async fn emit_tool_call_end(
     duration: Duration,
     result: Result<CallToolResult, String>,
 ) {
-    session
-        .send_event(
-            turn,
-            EventMsg::McpToolCallEnd(McpToolCallEndEvent {
-                call_id: call_id.to_string(),
-                invocation,
-                duration,
-                result,
-            }),
-        )
-        .await;
+    let (status, result, error) = match result {
+        Ok(result) if result.is_error.unwrap_or(false) => {
+            (McpToolCallStatus::Failed, Some(result), None)
+        }
+        Ok(result) => (McpToolCallStatus::Completed, Some(result), None),
+        Err(message) => (
+            McpToolCallStatus::Failed,
+            None,
+            Some(McpToolCallError { message }),
+        ),
+    };
+    let McpInvocation {
+        server,
+        tool,
+        arguments,
+    } = invocation;
+    let item = TurnItem::McpToolCall(McpToolCallItem {
+        id: call_id.to_string(),
+        server,
+        tool,
+        arguments: arguments.unwrap_or(Value::Null),
+        mcp_app_resource_uri: None,
+        status,
+        result,
+        error,
+        duration: Some(duration),
+    });
+    session.emit_turn_item_completed(turn, item).await;
 }
 
 fn normalize_optional_string(input: Option<String>) -> Option<String> {
